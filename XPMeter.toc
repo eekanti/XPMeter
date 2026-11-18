@@ -1,0 +1,11 @@
+## Interface: 16001
+## Title: XPMeter
+## Notes: Session XP tracker: kills, rested bonus, quests, exploration and everything else, with start/stop, pause and reset. MIT licensed.
+## Author: eekanti
+## Version: 1.0.0
+## OptionalDeps: EllesmereUI
+## X-License: MIT
+## X-Category: Quests & Leveling
+## SavedVariablesPerCharacter: XPMeterDB
+
+XPMeter.lua
