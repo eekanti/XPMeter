@@ -1,0 +1,42 @@
+# Pushing a version tag (v1.0.0) builds XPMeter-1.0.0.zip, with the addon in an "XPMeter" folder ready to drop
+# into Interface\AddOns, and publishes it as a GitHub release. The tag's message is the release notes.
+# The same zip is the one to upload to CurseForge (nothing from git, no scripts).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build the zip
+        run: |
+          git fetch --force --tags
+          VER="${GITHUB_REF_NAME#v}"
+          TOC_VER="$(sed -n 's/^## Version: *//p' XPMeter.toc | tr -d '\r')"
+          if [ "$VER" != "$TOC_VER" ]; then echo "Tag $GITHUB_REF_NAME doesn't match XPMeter.toc version $TOC_VER"; exit 1; fi
+          LUA_VER="$(sed -n 's/^local VERSION = "\(.*\)".*/\1/p' XPMeter.lua | tr -d '\r')"
+          if [ "$VER" != "$LUA_VER" ]; then echo "Tag $GITHUB_REF_NAME doesn't match VERSION $LUA_VER in XPMeter.lua"; exit 1; fi
+          mkdir -p build/XPMeter
+          rsync -a --exclude '.git*' --exclude '.github' --exclude 'build' --exclude '*.zip' ./ build/XPMeter/
+          (cd build && zip -qr "XPMeter-$VER.zip" XPMeter)
+          # CurseForge rejects archives with .git folders or scripts
+          if unzip -l "build/XPMeter-$VER.zip" | grep -E '\.git|\.bat|\.ps1|\.exe'; then echo "The zip has files CurseForge rejects"; exit 1; fi
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > build/notes.md
+          echo "VER=$VER" >> "$GITHUB_ENV"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "build/XPMeter-$VER.zip" \
+            --title "XPMeter $VER" --notes-file build/notes.md --latest
