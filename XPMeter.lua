@@ -1,4 +1,4 @@
--- XPMeter: session XP tracker with start / pause / stop.
+-- XPMeter: session XP and gold tracker with start / pause / stop. Gold sources are described in the "gold" section.
 --
 -- The total comes from the XP bar itself (PLAYER_XP_UPDATE deltas, level-ups included), so nothing is missed.
 -- It is split by source:
@@ -12,9 +12,9 @@
 -- Styled through EllesmereUI's skinning API when it's installed; a plain flat dark look otherwise.
 
 local ADDON = ...
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 
-local DEFAULTS = { shown = true, history = {} }
+local DEFAULTS = { shown = true, history = {}, collapsed = {} }
 local db                                  -- XPMeterDB (per character)
 local S                                   -- this session (db.s)
 local activeSince                         -- GetTime() when the current running stretch began
@@ -24,8 +24,11 @@ local function Print(msg) DEFAULT_CHAT_FRAME:AddMessage("|cFF8FB8FFXPMeter|r: " 
 
 local function NewSession()
   return { state = "stopped", acc = 0, total = 0, kill = 0, rested = 0, quest = 0, explore = 0,
-           kills = 0, quests = 0, discoveries = 0 }
+           kills = 0, quests = 0, discoveries = 0,
+           -- gold, in copper: coin looted, quest money + reward items, looted items valued at the AH or a vendor
+           gCoin = 0, gQuest = 0, gAH = 0, gVendor = 0, items = 0, loot = {} }
 end
+local function GoldTotal(s) return (s.gCoin or 0) + (s.gQuest or 0) + (s.gAH or 0) + (s.gVendor or 0) end
 
 ---------------------------------------------------------------- formatting
 local function Commas(n)
@@ -39,6 +42,19 @@ local function Short(n)
   if n >= 1e6 then return ("%.2fm"):format(n / 1e6) end
   if n >= 1e4 then return ("%.1fk"):format(n / 1e3) end
   return Commas(n)
+end
+-- copper as "12g 34s 56c" with coin colors; short drops the copper (and silver) once there's gold
+local function Money(c, short)
+  c = math.floor((c or 0) + 0.5)
+  local g, s, cu = math.floor(c / 10000), math.floor(c / 100) % 100, c % 100
+  local G, S_, C = "|cFFFFD100%sg|r", "|cFFC7C7CF%ds|r", "|cFFEDA55F%dc|r"
+  if g > 0 then
+    if short and g >= 100 then return G:format(Commas(g)) end
+    if short then return G:format(Commas(g)) .. " " .. S_:format(s) end
+    return G:format(Commas(g)) .. " " .. S_:format(s) .. " " .. C:format(cu)
+  end
+  if s > 0 then return short and S_:format(s) or (S_:format(s) .. " " .. C:format(cu)) end
+  return C:format(cu)
 end
 local function Clock(secs)
   secs = math.max(0, math.floor(secs or 0))
@@ -96,13 +112,15 @@ end
 local function Stop()
   if S.state == "stopped" then return end
   S.acc = Elapsed(); activeSince = nil; S.state = "stopped"; S.ended = time()
-  if S.total > 0 then
+  local gold = GoldTotal(S)
+  if S.total > 0 or gold > 0 then
     table.insert(db.history, 1, { started = S.started, ended = S.ended, secs = S.acc, total = S.total, kill = S.kill,
-      rested = S.rested, quest = S.quest, explore = S.explore, other = Other(), kills = S.kills, quests = S.quests })
+      rested = S.rested, quest = S.quest, explore = S.explore, other = Other(), kills = S.kills, quests = S.quests,
+      gold = gold, gCoin = S.gCoin, gQuest = S.gQuest, gAH = S.gAH, gVendor = S.gVendor })
     while #db.history > 20 do table.remove(db.history) end
   end
-  Print(("session stopped: %s XP in %s (%s XP/hr)."):format(Commas(S.total), Clock(S.acc),
-    S.acc >= 60 and Commas(S.total / S.acc * 3600) or "-"))
+  Print(("session stopped: %s XP and %s in %s (%s XP/hr, %s/hr)."):format(Commas(S.total), Money(gold), Clock(S.acc),
+    S.acc >= 60 and Commas(S.total / S.acc * 3600) or "-", S.acc >= 60 and Money(gold / S.acc * 3600, true) or "-"))
   Refresh()
 end
 local function Reset()
@@ -115,12 +133,12 @@ end
 
 ---------------------------------------------------------------- reading XP from the game
 -- turns a GlobalStrings format ("%s dies, you gain %d experience.") into a Lua pattern with captures
-local function Pattern(fmt, anchorEnd)
+local function Pattern(fmt, anchorEnd, keepPeriod)
   if type(fmt) ~= "string" then return nil end
   local p = fmt:gsub("%%%d?%$?([sd])", "\001%1")             -- placeholders (incl. %1$s) out of the way
   p = p:gsub("[%^%$%(%)%%%.%[%]%*%+%-%?]", "%%%0")            -- escape the rest
   p = p:gsub("\001s", "(.-)"):gsub("\001d", "([%%d,%%.]+)")
-  p = p:gsub("%%%.$", "")                                    -- trailing period optional (bonus text follows it)
+  if not keepPeriod then p = p:gsub("%%%.$", "") end         -- trailing period optional (bonus text follows it)
   return "^" .. p .. (anchorEnd and "$" or "")
 end
 local function Num(s) return tonumber((tostring(s or ""):gsub("[^%d]", ""))) end
@@ -131,6 +149,16 @@ local function BuildPatterns()
   PAT.unnamed = Pattern(COMBATLOG_XPGAIN_FIRSTPERSON_UNNAMED or "You gain %d experience.")
   PAT.explore = Pattern(ERR_ZONE_EXPLORED_XP or "Discovered %s: %d experience gained")
   PAT.restedWord = ((TUTORIAL_TITLE26 or "Rested"):lower())
+  -- loot lines must match whole ("You receive loot: [X]x3." would otherwise match the single-item form)
+  PAT.lootMulti = Pattern(LOOT_ITEM_SELF_MULTIPLE or "You receive loot: %sx%d.", true, true)
+  PAT.loot = Pattern(LOOT_ITEM_SELF or "You receive loot: %s.", true, true)
+  PAT.pushMulti = Pattern(LOOT_ITEM_PUSHED_SELF_MULTIPLE or "You receive item: %sx%d.", true, true)
+  PAT.push = Pattern(LOOT_ITEM_PUSHED_SELF or "You receive item: %s.", true, true)
+  PAT.coin = {}
+  for _, c in ipairs({ { GOLD_AMOUNT or "%d Gold", 10000 }, { SILVER_AMOUNT or "%d Silver", 100 }, { COPPER_AMOUNT or "%d Copper", 1 } }) do
+    local p = c[1]:gsub("[%^%$%(%)%.%[%]%*%+%-%?]", "%%%0"):gsub("%%d", "(%%d+)")
+    PAT.coin[#PAT.coin + 1] = { p, c[2] }
+  end
 end
 
 local function OnCombatXP(text)
@@ -157,10 +185,90 @@ local function OnSystem(text)
   if xp and xp > 0 then S.explore = S.explore + xp; S.discoveries = S.discoveries + 1 end
 end
 
-local function OnQuest(xpReward)
+local questAt = -100   -- GetTime() of the last turn-in: reward items pushed right after it count as quest rewards
+local function OnQuest(xpReward, moneyReward)
+  if not Running() then return end
+  questAt = GetTime()
+  moneyReward = tonumber(moneyReward)
+  if moneyReward and moneyReward > 0 then S.gQuest = S.gQuest + moneyReward end
   xpReward = tonumber(xpReward)
-  if not Running() or not xpReward or xpReward <= 0 or AtMaxLevel() then return end
+  if not xpReward or xpReward <= 0 or AtMaxLevel() then return end
   S.quest = S.quest + xpReward; S.quests = S.quests + 1
+end
+
+---------------------------------------------------------------- gold
+-- Coin: the "You loot 1 Silver, 20 Copper" / "Your share of the loot is ..." lines.
+-- Items: "You receive loot: [X]x3." valued once, when looted, at max(Auctionator's AH price, vendor price);
+-- soulbound (bind on pickup) items can't be sold on the AH, so they only count their vendor price.
+-- Quest rewards: QUEST_TURNED_IN's money, plus "You receive item: [X]." lines within 3 s of a turn-in.
+-- Money from selling to vendors or the AH, mail and trades is NOT counted: the items were already counted
+-- when looted, so counting the sale too would count them twice.
+local AUCTIONATOR_ID = "XPMeter"
+local function AHPrice(link)
+  local api = Auctionator and Auctionator.API and Auctionator.API.v1
+  if not (api and api.GetAuctionPriceByItemLink) then return nil end
+  local ok, p = pcall(api.GetAuctionPriceByItemLink, AUCTIONATOR_ID, link)
+  return ok and tonumber(p) or nil
+end
+local function VendorPrice(link, sell)
+  if sell and sell > 0 then return sell end
+  local api = Auctionator and Auctionator.API and Auctionator.API.v1
+  if api and api.GetVendorPriceByItemLink then
+    local ok, p = pcall(api.GetVendorPriceByItemLink, AUCTIONATOR_ID, link)
+    if ok and tonumber(p) then return tonumber(p) end
+  end
+  return 0
+end
+
+local pending = {}   -- items whose info wasn't cached yet: { link, count, quest, tries }
+local function AddItem(link, count, quest, tries)
+  local name, _, _, _, _, _, _, _, _, _, sell, _, _, bind = GetItemInfo(link)
+  if not name then
+    if (tries or 0) < 10 then pending[#pending + 1] = { link, count, quest, (tries or 0) + 1 } end
+    return
+  end
+  local vendor = VendorPrice(link, sell)
+  local ah = (bind ~= 1) and AHPrice(link) or nil      -- bind 1 = bind on pickup
+  local each, src = vendor, "vendor"
+  if ah and ah > vendor then each, src = ah, "ah" end
+  local value = each * count
+  if quest then S.gQuest = S.gQuest + value
+  elseif src == "ah" then S.gAH = S.gAH + value
+  else S.gVendor = S.gVendor + value end
+  S.items = S.items + count
+  local id = tonumber(link:match("item:(%d+)")) or link
+  local e = S.loot[id] or { link = link, count = 0, value = 0 }
+  e.count, e.value, e.src = e.count + count, e.value + value, quest and "quest" or src
+  S.loot[id] = e
+end
+local function RetryPending()
+  if #pending == 0 or not Running() then return end
+  local list = pending; pending = {}
+  for _, p in ipairs(list) do AddItem(p[1], p[2], p[3], p[4]) end
+end
+
+local function OnMoney(text)
+  if not Running() or type(text) ~= "string" then return end
+  local c = 0
+  for _, unit in ipairs(PAT.coin) do
+    local n = text:match(unit[1])
+    if n then c = c + tonumber(n) * unit[2] end
+  end
+  if c > 0 then S.gCoin = S.gCoin + c end
+end
+
+local function OnLoot(text)
+  if not Running() or type(text) ~= "string" then return end
+  local quest = false
+  local link, n = text:match(PAT.lootMulti)
+  if not link then link = text:match(PAT.loot) end
+  if not link and GetTime() - questAt <= 3 then          -- a quest's reward items arrive as "You receive item:"
+    link, n = text:match(PAT.pushMulti)
+    if not link then link = text:match(PAT.push) end
+    quest = link ~= nil
+  end
+  if not link or not link:find("|Hitem:", 1, true) then return end
+  AddItem(link, Num(n) or 1, quest)
 end
 
 local function OnXPUpdate()
@@ -203,8 +311,8 @@ local function Text(parent, template, width, justify)
   fonts[#fonts + 1] = fs
   return fs
 end
-local function Btn(label)
-  local b = CreateFrame("Button", nil, f, "UIPanelButtonTemplate"); b:SetHeight(22); b:SetText(label)
+local function Btn(label, parent)
+  local b = CreateFrame("Button", nil, parent or f, "UIPanelButtonTemplate"); b:SetHeight(22); b:SetText(label)
   buttons[#buttons + 1] = b
   return b
 end
@@ -217,13 +325,37 @@ local stateText = Text(f); stateText:SetPoint("LEFT", stateDot, "RIGHT", 4, 0)
 local closeX = CreateFrame("Button", nil, f, "UIPanelCloseButton"); closeX:SetSize(22, 22); closeX:SetPoint("TOPRIGHT", -3, -3)
 closeX:SetScript("OnClick", function() f:Hide(); db.shown = false end)
 
--- the headline: total and rate
-local totalText = Text(f, "GameFontHighlightLarge"); totalText:SetPoint("TOPLEFT", PAD, -38)
+-- Each section (XP, gold) is a headline that always shows and a body that collapses. Click a headline (or
+-- its +/- box) to fold that section; the title bar's box folds both into a mini mode. Saved in db.collapsed.
+local toggles = {}
+local Layout   -- defined after the sections
+local function Toggle(parent, key, y)
+  local b = CreateFrame("Button", nil, parent); b:SetSize(INNER, 26); b:SetPoint("TOPLEFT", PAD, y)
+  b.box = Btn("-", parent); b.box:SetSize(16, 16); b.box:SetPoint("LEFT", b, "LEFT", 0, 0)
+  local function Flip() db.collapsed[key] = not db.collapsed[key]; Layout() end
+  b:SetScript("OnClick", Flip); b.box:SetScript("OnClick", Flip)
+  b:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_TOP"); GameTooltip:SetText(db.collapsed[key] and "Click to expand" or "Click to collapse")
+    GameTooltip:Show()
+  end)
+  b:SetScript("OnLeave", function() GameTooltip:Hide() end)
+  b:RegisterForDrag("LeftButton")   -- the headline still drags the window
+  b:SetScript("OnDragStart", function() f:StartMoving() end)
+  b:SetScript("OnDragStop", function() f:GetScript("OnDragStop")(f) end)
+  b.key = key
+  toggles[#toggles + 1] = b
+  return b
+end
+
+-- the XP headline: total and rate
+local HEAD_X = PAD + 22   -- headline text starts right of the +/- box
+local xpToggle = Toggle(f, "xp", -36)
+local totalText = Text(f, "GameFontHighlightLarge"); totalText:SetPoint("TOPLEFT", HEAD_X, -38)
 local rateText = Text(f, "GameFontNormal", 140, "RIGHT"); rateText:SetPoint("TOPRIGHT", -PAD, -40)
 local timeText = Text(f, "GameFontDisableSmall"); timeText:SetPoint("TOPLEFT", totalText, "BOTTOMLEFT", 0, -3)
 local perText = Text(f, "GameFontDisableSmall", 150, "RIGHT"); perText:SetPoint("TOPRIGHT", rateText, "BOTTOMRIGHT", 0, -5)
 
--- level bar, with the rested pool shaded past the fill
+-- level bar, with the rested pool shaded past the fill (always shown, even with the XP section folded)
 local barHolder = CreateFrame("Frame", nil, f, "BackdropTemplate"); barHolder:SetSize(INNER, 16)
 barHolder:SetPoint("TOPLEFT", PAD, -84)
 local barBg = barHolder:CreateTexture(nil, "BACKGROUND"); barBg:SetAllPoints(); barBg:SetColorTexture(0, 0, 0, 0.5)
@@ -234,21 +366,71 @@ local barText = Text(bar, "GameFontHighlightSmall", INNER - 8, "CENTER"); barTex
 local levelText = Text(f, "GameFontDisableSmall", INNER, "LEFT"); levelText:SetPoint("TOPLEFT", barHolder, "BOTTOMLEFT", 0, -4)
 local restPool = Text(f, "GameFontDisableSmall", 120, "RIGHT"); restPool:SetPoint("TOPRIGHT", barHolder, "BOTTOMRIGHT", 0, -4)
 
--- the mix: one stacked strip, then a row per source
-local mixY = -122
-local mix = CreateFrame("Frame", nil, f); mix:SetSize(INNER, 5); mix:SetPoint("TOPLEFT", PAD, mixY)
-local mixBg = mix:CreateTexture(nil, "BACKGROUND"); mixBg:SetAllPoints(); mixBg:SetColorTexture(1, 1, 1, 0.06)
-local rows = {}
-for i, src in ipairs(SOURCES) do
-  local seg = mix:CreateTexture(nil, "ARTWORK"); seg:SetColorTexture(src.color[1], src.color[2], src.color[3], 0.9); seg:SetHeight(5)
-  local y = mixY - 12 - (i - 1) * 17
-  local sw = f:CreateTexture(nil, "ARTWORK"); sw:SetSize(8, 8); sw:SetPoint("TOPLEFT", PAD, y - 3)
-  sw:SetColorTexture(src.color[1], src.color[2], src.color[3], 1)
-  local label = Text(f); label:SetPoint("TOPLEFT", PAD + 14, y - 1)
-  local pct = Text(f, "GameFontDisableSmall", 40, "RIGHT"); pct:SetPoint("TOPRIGHT", -PAD, y - 1)
-  local val = Text(f, nil, 90, "RIGHT"); val:SetPoint("RIGHT", pct, "LEFT", -6, 0)
-  rows[i] = { src = src, seg = seg, label = label, val = val, pct = pct }
+-- the XP body (the source breakdown, which folds): offsets inside it are from XP_BODY_Y
+local XP_BODY_Y = -118
+local xpBody = CreateFrame("Frame", nil, f); xpBody:SetPoint("TOPLEFT", 0, XP_BODY_Y); xpBody:SetWidth(W)
+
+-- a mix inside parent: one stacked strip at y0, then a row per source; returns the strip, the rows, the y below
+local function Mix(p, list, y0, valW)
+  local m = CreateFrame("Frame", nil, p); m:SetSize(INNER, 5); m:SetPoint("TOPLEFT", PAD, y0)
+  local bg = m:CreateTexture(nil, "BACKGROUND"); bg:SetAllPoints(); bg:SetColorTexture(1, 1, 1, 0.06)
+  local out = {}
+  for i, src in ipairs(list) do
+    local seg = m:CreateTexture(nil, "ARTWORK"); seg:SetColorTexture(src.color[1], src.color[2], src.color[3], 0.9); seg:SetHeight(5)
+    local y = y0 - 12 - (i - 1) * 17
+    local hit = CreateFrame("Frame", nil, p); hit:SetSize(INNER, 16); hit:SetPoint("TOPLEFT", PAD, y + 2)
+    local sw = p:CreateTexture(nil, "ARTWORK"); sw:SetSize(8, 8); sw:SetPoint("TOPLEFT", PAD, y - 3)
+    sw:SetColorTexture(src.color[1], src.color[2], src.color[3], 1)
+    local label = Text(p); label:SetPoint("TOPLEFT", PAD + 14, y - 1)
+    local pct = Text(p, "GameFontDisableSmall", 40, "RIGHT"); pct:SetPoint("TOPRIGHT", -PAD, y - 1)
+    local val = Text(p, nil, valW or 90, "RIGHT"); val:SetPoint("RIGHT", pct, "LEFT", -6, 0)
+    out[i] = { src = src, seg = seg, label = label, val = val, pct = pct, hit = hit }
+  end
+  return m, out, y0 - 12 - #list * 17
 end
+local mix, rows, xpBodyBottom = Mix(xpBody, SOURCES, -4)
+xpBody:SetHeight(-xpBodyBottom)
+
+-- gold: headline, then its own mix
+local GOLD = {
+  { key = "gCoin",   label = "Coin looted",    color = { 1.00, 0.82, 0.00 } },
+  { key = "gAH",     label = "Items (AH)",     color = { 0.64, 0.42, 0.93 } },
+  { key = "gVendor", label = "Items (vendor)", color = { 0.62, 0.62, 0.66 } },
+  { key = "gQuest",  label = "Quest rewards",  color = { 0.36, 0.84, 0.46 } },
+}
+-- the gold section moves up and down with the XP body; its own body folds the same way
+local goldSec = CreateFrame("Frame", nil, f); goldSec:SetWidth(W)
+local goldSep = goldSec:CreateTexture(nil, "ARTWORK"); goldSep:SetColorTexture(1, 1, 1, 0.08); goldSep:SetHeight(1)
+goldSep:SetPoint("TOPLEFT", PAD, 0); goldSep:SetPoint("TOPRIGHT", -PAD, 0)
+local goldToggle = Toggle(goldSec, "gold", -6)
+local goldText = Text(goldSec, "GameFontHighlightLarge"); goldText:SetPoint("TOPLEFT", HEAD_X, -10)
+local goldRate = Text(goldSec, "GameFontNormal", 150, "RIGHT"); goldRate:SetPoint("TOPRIGHT", -PAD, -12)
+local GOLD_HEAD_H = 34
+local goldBody = CreateFrame("Frame", nil, goldSec); goldBody:SetPoint("TOPLEFT", 0, -GOLD_HEAD_H); goldBody:SetWidth(W)
+local goldMix, goldRows, goldBodyBottom = Mix(goldBody, GOLD, -4, 130)
+goldBody:SetHeight(-goldBodyBottom)
+
+-- hovering an item row lists its most valuable items
+local function ItemTip(row, which)
+  row.hit:EnableMouse(true)
+  row.hit:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_RIGHT"); GameTooltip:SetText(row.src.label)
+    local list = {}
+    for _, e in pairs(S and S.loot or {}) do if e.src == which then list[#list + 1] = e end end
+    table.sort(list, function(a, b) return a.value > b.value end)
+    if #list == 0 then GameTooltip:AddLine("Nothing yet.", 0.7, 0.7, 0.7) end
+    for i = 1, math.min(12, #list) do
+      local e = list[i]
+      GameTooltip:AddDoubleLine(e.link .. (e.count > 1 and (" x" .. e.count) or ""), Money(e.value), 1, 1, 1, 1, 1, 1)
+    end
+    if #list > 12 then GameTooltip:AddLine(("+ %d more"):format(#list - 12), 0.7, 0.7, 0.7) end
+    if which == "ah" then GameTooltip:AddLine("Valued at Auctionator's price when looted.", 0.7, 0.7, 0.7, true) end
+    if which == "vendor" then GameTooltip:AddLine("No AH price (or it was below vendor), or soulbound.", 0.7, 0.7, 0.7, true) end
+    GameTooltip:Show()
+  end)
+  row.hit:SetScript("OnLeave", function() GameTooltip:Hide() end)
+end
+ItemTip(goldRows[2], "ah"); ItemTip(goldRows[3], "vendor"); ItemTip(goldRows[4], "quest")
 
 -- start/stop toggle, pause/resume, reset
 local startBtn, pauseBtn, resetBtn = Btn("Start"), Btn("Pause"), Btn("Reset")
@@ -256,7 +438,31 @@ local BW = math.floor((INNER - 12) / 3)
 for i, b in ipairs({ startBtn, pauseBtn, resetBtn }) do
   b:SetWidth(BW); b:SetPoint("BOTTOMLEFT", PAD + (i - 1) * (BW + 6), PAD)
 end
-f:SetHeight(-(mixY - 12 - #SOURCES * 17) + 14 + 22 + PAD)
+-- the title bar's box: fold both sections (mini mode) or open both
+local miniBtn = Btn("-"); miniBtn:SetSize(16, 16); miniBtn:SetPoint("RIGHT", closeX, "LEFT", -4, 0)
+miniBtn:SetScript("OnClick", function()
+  local mini = not (db.collapsed.xp and db.collapsed.gold)
+  db.collapsed.xp, db.collapsed.gold = mini, mini
+  Layout()
+end)
+miniBtn:SetScript("OnEnter", function(self)
+  GameTooltip:SetOwner(self, "ANCHOR_TOP"); GameTooltip:SetText("Mini mode")
+  GameTooltip:AddLine("Folds both sections down to their totals. Click a section's headline to fold just that one.", 1, 1, 1, true)
+  GameTooltip:Show()
+end)
+miniBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+function Layout()
+  local c = db and db.collapsed or {}
+  xpBody:SetShown(not c.xp); goldBody:SetShown(not c.gold)
+  for _, t in ipairs(toggles) do t.box:SetText(c[t.key] and "+" or "-") end
+  miniBtn:SetText((c.xp and c.gold) and "+" or "-")
+  local y = c.xp and XP_BODY_Y or (XP_BODY_Y + xpBodyBottom)       -- bottom of the XP section
+  goldSec:ClearAllPoints(); goldSec:SetPoint("TOPLEFT", 0, y - 8)
+  local goldH = GOLD_HEAD_H + (c.gold and 0 or -goldBodyBottom)
+  goldSec:SetHeight(goldH)
+  f:SetHeight(-(y - 8 - goldH) + 10 + 22 + PAD)
+end
 startBtn:SetScript("OnClick", function() if S.state == "stopped" then Start() else Stop() end end)
 pauseBtn:SetScript("OnClick", function() if S.state == "paused" then Resume() else Pause() end end)
 resetBtn:SetScript("OnClick", function() Reset() end)
@@ -267,8 +473,8 @@ local function Tip(btn, head, body)
   btn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 end
 Tip(startBtn, "Start / Stop", "Start begins a new session from zero. Stop ends it, keeps its numbers on screen and saves it to /xpm history.")
-Tip(pauseBtn, "Pause / Resume", "While paused no XP or time is counted.")
-Tip(resetBtn, "Reset", "Zeroes the time and XP. A running or paused session keeps going from zero.")
+Tip(pauseBtn, "Pause / Resume", "While paused no XP, gold or time is counted.")
+Tip(resetBtn, "Reset", "Zeroes the time, XP and gold. A running or paused session keeps going from zero.")
 barHolder:EnableMouse(true)
 barHolder:SetScript("OnEnter", function(self)
   local cur, max, rest = UnitXP("player"), UnitXPMax("player"), GetXPExhaustion() or 0
@@ -322,30 +528,41 @@ function Refresh()
     restPool:SetText(rest > 0 and ("Rested " .. Short(rest)) or "Not rested")
   end
 
-  local values = { kill = S.kill, rested = S.rested, quest = S.quest, explore = S.explore, other = Other() }
-  local sum = 0
-  for _, v in pairs(values) do sum = sum + v end
-  local x, mw = 0, mix:GetWidth()
-  for _, r in ipairs(rows) do
-    local v, key = values[r.src.key], r.src.key
-    local label = r.src.label
-    if key == "kill" and S.kills > 0 then label = label .. " |cFF888888(" .. S.kills .. ")|r" end
-    if key == "quest" and S.quests > 0 then label = label .. " |cFF888888(" .. S.quests .. ")|r" end
-    if key == "explore" and S.discoveries > 0 then label = label .. " |cFF888888(" .. S.discoveries .. ")|r" end
-    r.label:SetText(label)
-    r.val:SetText(Commas(v))
-    r.pct:SetText(sum > 0 and ("%d%%"):format(math.floor(v / sum * 100 + 0.5)) or "-")
-    local segW = sum > 0 and (v / sum * mw) or 0
-    if segW >= 0.5 then
-      r.seg:ClearAllPoints(); r.seg:SetPoint("TOPLEFT", mix, "TOPLEFT", x, 0); r.seg:SetWidth(segW); r.seg:Show()
-      x = x + segW
-    else r.seg:Hide() end
+  local function Fill(m, list, values, fmt, extra)
+    local sum = 0
+    for _, v in pairs(values) do sum = sum + v end
+    local x, mw = 0, m:GetWidth()
+    for _, r in ipairs(list) do
+      local v = values[r.src.key]
+      r.label:SetText(r.src.label .. (extra[r.src.key] or ""))
+      r.val:SetText(fmt(v))
+      r.pct:SetText(sum > 0 and ("%d%%"):format(math.floor(v / sum * 100 + 0.5)) or "-")
+      local segW = sum > 0 and (v / sum * mw) or 0
+      if segW >= 0.5 then
+        r.seg:ClearAllPoints(); r.seg:SetPoint("TOPLEFT", m, "TOPLEFT", x, 0); r.seg:SetWidth(segW); r.seg:Show()
+        x = x + segW
+      else r.seg:Hide() end
+    end
   end
+  local function N(n) return n > 0 and (" |cFF888888(" .. n .. ")|r") or nil end
+  Fill(mix, rows, { kill = S.kill, rested = S.rested, quest = S.quest, explore = S.explore, other = Other() }, Commas,
+    { kill = N(S.kills), quest = N(S.quests), explore = N(S.discoveries) })
+
+  local gold = GoldTotal(S)
+  goldText:SetText("+" .. Money(gold))
+  goldRate:SetText(e >= 60 and (Money(gold / e * 3600, true) .. " /hr") or "- /hr")
+  goldRate:SetTextColor(accent[1], accent[2], accent[3])
+  local nAH, nV, nQ = 0, 0, 0
+  for _, it in pairs(S.loot) do
+    if it.src == "ah" then nAH = nAH + it.count elseif it.src == "vendor" then nV = nV + it.count else nQ = nQ + it.count end
+  end
+  Fill(goldMix, goldRows, { gCoin = S.gCoin, gAH = S.gAH, gVendor = S.gVendor, gQuest = S.gQuest }, Money,
+    { gAH = N(nAH), gVendor = N(nV), gQuest = N(nQ) })
 
   startBtn:SetText(S.state == "stopped" and "Start" or "Stop")
   pauseBtn:SetText(S.state == "paused" and "Resume" or "Pause")
   SetEnabled(pauseBtn, S.state ~= "stopped")
-  SetEnabled(resetBtn, S.total > 0 or Elapsed() > 0)
+  SetEnabled(resetBtn, S.total > 0 or gold > 0 or Elapsed() > 0)
 end
 f:SetScript("OnShow", function() Refresh() end)
 
@@ -387,6 +604,9 @@ ev:RegisterEvent("UPDATE_EXHAUSTION")
 ev:RegisterEvent("CHAT_MSG_COMBAT_XP_GAIN")
 ev:RegisterEvent("CHAT_MSG_SYSTEM")
 ev:RegisterEvent("QUEST_TURNED_IN")
+ev:RegisterEvent("CHAT_MSG_MONEY")
+ev:RegisterEvent("CHAT_MSG_LOOT")
+ev:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 ev:RegisterEvent("PLAYER_LOGOUT")
 ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
   if event == "ADDON_LOADED" then
@@ -395,11 +615,13 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
     db = XPMeterDB
     for k, v in pairs(DEFAULTS) do if db[k] == nil then db[k] = type(v) == "table" and {} or v end end
     db.s = db.s or NewSession(); S = db.s
+    for k, v in pairs(NewSession()) do if S[k] == nil then S[k] = v end end   -- sessions saved by older versions
     if S.state == "running" then activeSince = GetTime() end   -- picks up where /reload or logout left off
     if db.pos then
       f:ClearAllPoints(); f:SetPoint(db.pos[1], UIParent, db.pos[2] or db.pos[1], db.pos[3] or 0, db.pos[4] or 0)
     end
     BuildPatterns()
+    Layout()
   elseif event == "PLAYER_ENTERING_WORLD" then
     lastXP, lastMax = UnitXP("player"), UnitXPMax("player")
     if a1 or a2 then   -- login or reload
@@ -416,13 +638,19 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
   elseif event == "CHAT_MSG_SYSTEM" then
     OnSystem(a1)
   elseif event == "QUEST_TURNED_IN" then
-    OnQuest(a2); Refresh()
+    OnQuest(a2, a3); Refresh()
+  elseif event == "CHAT_MSG_MONEY" then
+    OnMoney(a1); Refresh()
+  elseif event == "CHAT_MSG_LOOT" then
+    OnLoot(a1); Refresh()
+  elseif event == "GET_ITEM_INFO_RECEIVED" then
+    RetryPending()
   elseif event == "PLAYER_LOGOUT" then
     if S and S.state == "running" then S.acc = Elapsed(); activeSince = GetTime() end   -- offline time never counts
   end
 end)
 
-C_Timer.NewTicker(1, function() if f:IsShown() then Refresh() end end)
+C_Timer.NewTicker(1, function() RetryPending(); if f:IsShown() then Refresh() end end)
 
 ---------------------------------------------------------------- slash commands
 local function History()
@@ -434,6 +662,11 @@ local function History()
     DEFAULT_CHAT_FRAME:AddMessage(("  %s  %s XP in %s (%s/hr)  kills %s, rested %s, quests %s, explore %s, other %s"):format(
       h.started and date("%m/%d %H:%M", h.started) or "?", Commas(h.total), Clock(h.secs), rate,
       Short(h.kill), Short(h.rested), Short(h.quest), Short(h.explore), Short(h.other)))
+    if (h.gold or 0) > 0 then
+      DEFAULT_CHAT_FRAME:AddMessage(("      gold %s (%s/hr)  coin %s, items AH %s, vendor %s, quests %s"):format(Money(h.gold),
+        h.secs >= 60 and Money(h.gold / h.secs * 3600, true) or "-", Money(h.gCoin, true), Money(h.gAH, true),
+        Money(h.gVendor, true), Money(h.gQuest, true)))
+    end
   end
 end
 
@@ -448,7 +681,11 @@ SlashCmdList.XPMETER = function(msg)
   elseif cmd == "stop" then Stop()
   elseif cmd == "reset" then Reset(); Print("session numbers cleared.")
   elseif cmd == "history" then History()
+  elseif cmd == "mini" then
+    local mini = not (db.collapsed.xp and db.collapsed.gold)
+    db.collapsed.xp, db.collapsed.gold = mini, mini
+    Layout()
   else
-    Print("v" .. VERSION .. "  /xpm [start | pause | resume | stop | reset | history]  (no argument shows or hides the window)")
+    Print("v" .. VERSION .. "  /xpm [start | pause | resume | stop | reset | history | mini]  (no argument shows or hides the window)")
   end
 end
