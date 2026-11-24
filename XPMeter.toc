@@ -2,7 +2,7 @@
 ## Title: XPMeter
 ## Notes: Session XP and gold tracker: XP from kills, rested, quests and exploration; gold from coin, looted items (Auctionator or vendor value) and quest rewards. Start/stop, pause, reset. MIT licensed.
 ## Author: eekanti
-## Version: 1.1.0
+## Version: 1.1.2
 ## OptionalDeps: EllesmereUI, Auctionator
 ## X-License: MIT
 ## X-Category: Quests & Leveling

@@ -37,7 +37,7 @@ A running session survives `/reload` and logging out; offline time is never coun
 ## Slash commands
 
 `/xpm` (or `/xpmeter`) shows or hides the window.
-`/xpm start | pause | resume | stop | reset | history | mini`
+`/xpm start | pause | resume | stop | reset | history | mini | debug`
 
 ## Look
 
@@ -46,6 +46,11 @@ accent and bar fill); a plain flat dark window otherwise. Item values come from
 Auctionator when it's installed; without it every item counts at vendor price.
 
 ## Changelog
+
+### 1.1.2 (2026-11-24 18:21 EST)
+- Fix: looted items weren't counted. Forever hides some loot chat lines from addons, so items are now read from the loot window and counted once you take them (or they land in your bags), quest reward items from your bags right after a turn-in, and coin from your money going up while looting.
+- Chat lines Forever hides from addons are skipped instead of raising errors; any other error is now shown once in chat.
+- /xpm debug prints what the gold tracking sees, to help track down problems.
 
 ### 1.1.0 (2026-11-24 01:50 EST)
 - Gold tracking: coin looted, looted items at AH or vendor value, quest money and reward items.

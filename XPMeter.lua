@@ -12,7 +12,7 @@
 -- Styled through EllesmereUI's skinning API when it's installed; a plain flat dark look otherwise.
 
 local ADDON = ...
-local VERSION = "1.1.0"
+local VERSION = "1.1.2"
 
 local DEFAULTS = { shown = true, history = {}, collapsed = {} }
 local db                                  -- XPMeterDB (per character)
@@ -21,6 +21,16 @@ local activeSince                         -- GetTime() when the current running 
 local lastXP, lastMax                     -- XP bar baseline for deltas
 
 local function Print(msg) DEFAULT_CHAT_FRAME:AddMessage("|cFF8FB8FFXPMeter|r: " .. msg) end
+-- /xpm debug: prints what the gold tracking sees (loot window, bags, item values)
+local function D(...)
+  if not (XPMeterDB and XPMeterDB.debug) then return end
+  local parts = {}
+  for i = 1, select("#", ...) do
+    local v = select(i, ...)
+    parts[i] = (issecretvalue and issecretvalue(v)) and "<secret>" or tostring(v)
+  end
+  DEFAULT_CHAT_FRAME:AddMessage("|cFF8FB8FFXPMeter debug|r: " .. table.concat(parts, " "))
+end
 
 local function NewSession()
   return { state = "stopped", acc = 0, total = 0, kill = 0, rested = 0, quest = 0, explore = 0,
@@ -149,11 +159,6 @@ local function BuildPatterns()
   PAT.unnamed = Pattern(COMBATLOG_XPGAIN_FIRSTPERSON_UNNAMED or "You gain %d experience.")
   PAT.explore = Pattern(ERR_ZONE_EXPLORED_XP or "Discovered %s: %d experience gained")
   PAT.restedWord = ((TUTORIAL_TITLE26 or "Rested"):lower())
-  -- loot lines must match whole ("You receive loot: [X]x3." would otherwise match the single-item form)
-  PAT.lootMulti = Pattern(LOOT_ITEM_SELF_MULTIPLE or "You receive loot: %sx%d.", true, true)
-  PAT.loot = Pattern(LOOT_ITEM_SELF or "You receive loot: %s.", true, true)
-  PAT.pushMulti = Pattern(LOOT_ITEM_PUSHED_SELF_MULTIPLE or "You receive item: %sx%d.", true, true)
-  PAT.push = Pattern(LOOT_ITEM_PUSHED_SELF or "You receive item: %s.", true, true)
   PAT.coin = {}
   for _, c in ipairs({ { GOLD_AMOUNT or "%d Gold", 10000 }, { SILVER_AMOUNT or "%d Silver", 100 }, { COPPER_AMOUNT or "%d Copper", 1 } }) do
     local p = c[1]:gsub("[%^%$%(%)%.%[%]%*%+%-%?]", "%%%0"):gsub("%%d", "(%%d+)")
@@ -161,8 +166,15 @@ local function BuildPatterns()
   end
 end
 
+-- Forever marks some chat lines as "secret": reading them from addon code raises an error instead of
+-- returning text. Those lines are skipped (their XP still lands in the total, under Other).
+local function Readable(s)
+  if issecretvalue and issecretvalue(s) then return false end
+  return type(s) == "string"
+end
+
 local function OnCombatXP(text)
-  if not Running() or type(text) ~= "string" then return end
+  if not Running() or not Readable(text) then return end
   if PAT.unnamed and text:match(PAT.unnamed) then return end   -- quest turn-in echo etc.: left to "Other"/"Quests"
   local _, xp = text:match(PAT.kill or "^(.-) dies, you gain ([%d,]+) experience")
   xp = Num(xp)
@@ -179,7 +191,7 @@ local function OnCombatXP(text)
 end
 
 local function OnSystem(text)
-  if not Running() or type(text) ~= "string" or not PAT.explore then return end
+  if not Running() or not Readable(text) or not PAT.explore then return end
   local _, xp = text:match(PAT.explore)
   xp = Num(xp)
   if xp and xp > 0 then S.explore = S.explore + xp; S.discoveries = S.discoveries + 1 end
@@ -197,12 +209,15 @@ local function OnQuest(xpReward, moneyReward)
 end
 
 ---------------------------------------------------------------- gold
--- Coin: the "You loot 1 Silver, 20 Copper" / "Your share of the loot is ..." lines.
--- Items: "You receive loot: [X]x3." valued once, when looted, at max(Auctionator's AH price, vendor price);
--- soulbound (bind on pickup) items can't be sold on the AH, so they only count their vendor price.
--- Quest rewards: QUEST_TURNED_IN's money, plus "You receive item: [X]." lines within 3 s of a turn-in.
+-- Forever's loot chat lines can be secret (unreadable), so gold doesn't come from chat:
+-- Coin: your money going up while a loot window is open (or up to 2 s after it closes). A party member's
+--   coin share, which arrives without your loot window, comes from its chat line when that's readable.
+-- Items: what's new in your bags while looting, valued once, when looted, at max(Auctionator's AH price,
+--   vendor price); soulbound (bind on pickup) items can't be sold on the AH, so they only count their vendor price.
+-- Quest rewards: QUEST_TURNED_IN's money, plus items new in your bags within 3 s of a turn-in.
 -- Money from selling to vendors or the AH, mail and trades is NOT counted: the items were already counted
--- when looted, so counting the sale too would count them twice.
+-- when looted, so counting the sale too would count them twice. Bag changes outside looting (buying, mail,
+-- crafting, trades) aren't counted either.
 local AUCTIONATOR_ID = "XPMeter"
 local function AHPrice(link)
   local api = Auctionator and Auctionator.API and Auctionator.API.v1
@@ -220,10 +235,19 @@ local function VendorPrice(link, sell)
   return 0
 end
 
+-- Forever's client has C_Item.GetItemInfo; the old global GetItemInfo may not exist there
+local function ItemInfo(link)
+  local get = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+  if not get then return nil end
+  return get(link)
+end
+
 local pending = {}   -- items whose info wasn't cached yet: { link, count, quest, tries }
 local function AddItem(link, count, quest, tries)
-  local name, _, _, _, _, _, _, _, _, _, sell, _, _, bind = GetItemInfo(link)
+  if not Readable(link) then D("item link is secret, skipped"); return end
+  local name, _, _, _, _, _, _, _, _, _, sell, _, _, bind = ItemInfo(link)
   if not name then
+    D("item not cached yet, will retry:", link, "x" .. count)
     if (tries or 0) < 10 then pending[#pending + 1] = { link, count, quest, (tries or 0) + 1 } end
     return
   end
@@ -240,6 +264,7 @@ local function AddItem(link, count, quest, tries)
   local e = S.loot[id] or { link = link, count = 0, value = 0 }
   e.count, e.value, e.src = e.count + count, e.value + value, quest and "quest" or src
   S.loot[id] = e
+  D("counted", link, "x" .. count, "=", value, "copper (" .. (quest and "quest" or src) .. "; AH", ah, "vendor", vendor .. ")")
 end
 local function RetryPending()
   if #pending == 0 or not Running() then return end
@@ -247,8 +272,26 @@ local function RetryPending()
   for _, p in ipairs(list) do AddItem(p[1], p[2], p[3], p[4]) end
 end
 
-local function OnMoney(text)
-  if not Running() or type(text) ~= "string" then return end
+-- looting context: the loot window is open, or closed less than 2 s ago (bags and money update a moment later)
+local lootOpen, lootClosedAt = false, -100
+local function Looting() return lootOpen or GetTime() - lootClosedAt <= 2 end
+local function QuestReward() return GetTime() - questAt <= 3 end
+
+local lastMoney
+local function OnPlayerMoney()
+  local now = GetMoney()
+  local d = lastMoney and (now - lastMoney) or 0
+  lastMoney = now
+  if d > 0 then
+    D("money +" .. d, not Running() and "(session not running: not counted)"
+      or (Looting() and "while looting: counted" or "not looting: ignored"))
+  end
+  if d > 0 and Running() and Looting() then S.gCoin = S.gCoin + d end
+end
+
+-- a party member looted coin and you got a share: no loot window of yours, so read the chat line if we can
+local function OnMoneyChat(text)
+  if not Running() or Looting() or not Readable(text) then return end
   local c = 0
   for _, unit in ipairs(PAT.coin) do
     local n = text:match(unit[1])
@@ -257,18 +300,97 @@ local function OnMoney(text)
   if c > 0 then S.gCoin = S.gCoin + c end
 end
 
-local function OnLoot(text)
-  if not Running() or type(text) ~= "string" then return end
-  local quest = false
-  local link, n = text:match(PAT.lootMulti)
-  if not link then link = text:match(PAT.loot) end
-  if not link and GetTime() - questAt <= 3 then          -- a quest's reward items arrive as "You receive item:"
-    link, n = text:match(PAT.pushMulti)
-    if not link then link = text:match(PAT.push) end
-    quest = link ~= nil
+-- bag contents: itemID -> { count, link }
+local function BagCounts()
+  local out = {}
+  local C = C_Container
+  local numSlots = (C and C.GetContainerNumSlots) or GetContainerNumSlots
+  for bag = 0, NUM_BAG_SLOTS or 4 do
+    for slot = 1, (numSlots and numSlots(bag)) or 0 do
+      local id, n, link
+      if C and C.GetContainerItemInfo then
+        local info = C.GetContainerItemInfo(bag, slot)
+        if info then id, n, link = info.itemID, info.stackCount, info.hyperlink end
+      elseif GetContainerItemInfo then
+        local _, count, _, _, _, _, l, _, _, itemID = GetContainerItemInfo(bag, slot)
+        id, n, link = itemID, count, l
+      end
+      if id then
+        local e = out[id]
+        if e then e[1] = e[1] + (n or 1) else out[id] = { n or 1, link } end
+      end
+    end
   end
-  if not link or not link:find("|Hitem:", 1, true) then return end
-  AddItem(link, Num(n) or 1, quest)
+  return out
+end
+-- Looted items: the loot window is read when it opens, and each item is counted when there's proof you got
+-- it: its slot being taken (LOOT_SLOT_CLEARED) or the item turning up in your bags, whichever comes first.
+-- Forever doesn't reliably send the first one (or sends it after the window closes), so the bags back it up.
+-- An item is never counted for more than the window held, so the two can't count it twice.
+local lootSlots, expected = {}, {}   -- slot -> { id, qty };  itemID -> { link, qty, at }
+local windowRead = false
+local function Take(id, n, why)
+  local e = expected[id]
+  if not e or e.qty <= 0 or n <= 0 then return end
+  if GetTime() - e.at > 5 then expected[id] = nil; return end   -- that window is long gone
+  local take = math.min(n, e.qty)
+  e.qty = e.qty - take
+  if e.qty <= 0 then expected[id] = nil end
+  D(why, e.link, "x" .. take)
+  if Running() then AddItem(e.link, take, false) else D("session not running: not counted") end
+end
+local function ReadLootSlots()
+  wipe(lootSlots)
+  for id, e in pairs(expected) do if GetTime() - e.at > 5 then expected[id] = nil end end   -- leftovers
+  local n = GetNumLootItems and GetNumLootItems() or 0
+  for i = 1, n do
+    local isItem
+    if GetLootSlotType then isItem = GetLootSlotType(i) == ((Enum and Enum.LootSlotType and Enum.LootSlotType.Item) or 1)
+    else isItem = LootSlotHasItem and LootSlotHasItem(i) end
+    if isItem then
+      local link = GetLootSlotLink(i)
+      local _, _, qty = GetLootSlotInfo(i)
+      qty = math.max(1, tonumber(qty) or 1)
+      local id = Readable(link) and tonumber(link:match("item:(%d+)"))
+      D("loot slot", i, link, "x" .. qty)
+      if id then
+        lootSlots[i] = { id, qty }
+        local e = expected[id]
+        if e then e.qty, e.at = e.qty + qty, GetTime() else expected[id] = { link = link, qty = qty, at = GetTime() } end
+      else
+        D("slot", i, "has no readable item link")
+      end
+    end
+  end
+  D("loot window:", n, "slots")
+end
+local function OnLootSlotCleared(slot)
+  local e = lootSlots[slot]
+  D("slot taken:", slot, e and "" or "(not an item slot)")
+  lootSlots[slot] = nil
+  if e then Take(e[1], e[2], "counted from loot slot:") end
+end
+
+-- bags: looted items (backing up the slot signal) and quest reward items right after a turn-in
+local bags
+local function OnBags()
+  local now = BagCounts()
+  local was = bags
+  bags = now
+  if not was then return end
+  local quest = QuestReward() and not Looting()
+  for id, e in pairs(now) do
+    local d = e[1] - (was[id] and was[id][1] or 0)
+    if d > 0 then
+      if expected[id] and Looting() then
+        Take(id, d, "counted from bags:")
+      elseif quest and Running() and e[2] then
+        D("quest reward in bags:", e[2], "x" .. d); AddItem(e[2], d, true)
+      elseif Looting() then
+        D("in bags (already counted or not from the loot window):", e[2], "x" .. d)
+      end
+    end
+  end
 end
 
 local function OnXPUpdate()
@@ -605,10 +727,16 @@ ev:RegisterEvent("CHAT_MSG_COMBAT_XP_GAIN")
 ev:RegisterEvent("CHAT_MSG_SYSTEM")
 ev:RegisterEvent("QUEST_TURNED_IN")
 ev:RegisterEvent("CHAT_MSG_MONEY")
-ev:RegisterEvent("CHAT_MSG_LOOT")
+ev:RegisterEvent("PLAYER_MONEY")
+ev:RegisterEvent("LOOT_READY")
+ev:RegisterEvent("LOOT_OPENED")
+ev:RegisterEvent("LOOT_CLOSED")
+ev:RegisterEvent("LOOT_SLOT_CLEARED")
+ev:RegisterEvent("BAG_UPDATE_DELAYED")
 ev:RegisterEvent("GET_ITEM_INFO_RECEIVED")
 ev:RegisterEvent("PLAYER_LOGOUT")
-ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
+local reported = {}
+local function OnEvent(_, event, a1, a2, a3)
   if event == "ADDON_LOADED" then
     if a1 ~= ADDON then return end
     XPMeterDB = XPMeterDB or {}
@@ -624,6 +752,7 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
     Layout()
   elseif event == "PLAYER_ENTERING_WORLD" then
     lastXP, lastMax = UnitXP("player"), UnitXPMax("player")
+    lastMoney = GetMoney(); bags = BagCounts()
     if a1 or a2 then   -- login or reload
       PlainLook()
       if db.shown then f:Show() end
@@ -640,13 +769,35 @@ ev:SetScript("OnEvent", function(_, event, a1, a2, a3)
   elseif event == "QUEST_TURNED_IN" then
     OnQuest(a2, a3); Refresh()
   elseif event == "CHAT_MSG_MONEY" then
-    OnMoney(a1); Refresh()
-  elseif event == "CHAT_MSG_LOOT" then
-    OnLoot(a1); Refresh()
+    OnMoneyChat(a1); Refresh()
+  elseif event == "PLAYER_MONEY" then
+    OnPlayerMoney(); Refresh()
+  elseif event == "LOOT_READY" or event == "LOOT_OPENED" then
+    if not windowRead then ReadLootSlots(); windowRead = true end
+    lootOpen = true
+  elseif event == "LOOT_SLOT_CLEARED" then
+    OnLootSlotCleared(a1); Refresh()
+  elseif event == "LOOT_CLOSED" then
+    lootOpen, lootClosedAt, windowRead = false, GetTime(), false   -- slots kept: Forever may report them after closing
+    D("loot window closed")
+  elseif event == "BAG_UPDATE_DELAYED" then
+    OnBags(); Refresh()
   elseif event == "GET_ITEM_INFO_RECEIVED" then
     RetryPending()
   elseif event == "PLAYER_LOGOUT" then
     if S and S.state == "running" then S.acc = Elapsed(); activeSince = GetTime() end   -- offline time never counts
+  end
+end
+-- an error in one event never stops the others; each kind is reported once (in chat, so hidden Lua errors show)
+ev:SetScript("OnEvent", function(...)
+  local ok, err = pcall(OnEvent, ...)
+  if not ok then
+    local event = select(2, ...)
+    local key = tostring(event) .. tostring(err)
+    if not reported[key] then
+      reported[key] = true
+      Print(("error in %s (please report it): %s"):format(tostring(event), tostring(err)))
+    end
   end
 end)
 
@@ -681,11 +832,15 @@ SlashCmdList.XPMETER = function(msg)
   elseif cmd == "stop" then Stop()
   elseif cmd == "reset" then Reset(); Print("session numbers cleared.")
   elseif cmd == "history" then History()
+  elseif cmd == "debug" then
+    db.debug = not db.debug
+    Print("v" .. VERSION .. " debug " .. (db.debug and "on: loot something and the details print here." or "off.")
+      .. ((db.debug and S.state ~= "running") and " The session isn't running, so nothing will be counted until you start or resume it." or ""))
   elseif cmd == "mini" then
     local mini = not (db.collapsed.xp and db.collapsed.gold)
     db.collapsed.xp, db.collapsed.gold = mini, mini
     Layout()
   else
-    Print("v" .. VERSION .. "  /xpm [start | pause | resume | stop | reset | history | mini]  (no argument shows or hides the window)")
+    Print("v" .. VERSION .. "  /xpm [start | pause | resume | stop | reset | history | mini | debug]  (no argument shows or hides the window)")
   end
 end
