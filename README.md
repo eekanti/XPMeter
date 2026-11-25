@@ -16,7 +16,7 @@ and every copper you earn, and shows where they came from.
 - Gold made and gold per hour, by source:
   - **Coin looted**: gold, silver and copper from mobs, chests and your share of group loot
   - **Items (AH)**: looted items valued at Auctionator's AH price when you looted them
-  - **Items (vendor)**: items with no AH price (or an AH price below vendor), and soulbound items, at vendor price
+  - **Items (vendor)**: items with no AH price (or an AH price below vendor), soulbound items and grey items, at vendor price
   - **Quest rewards**: quest money plus the value of reward items
   - Hover an item row to see its most valuable items
 - Selling to vendors or the AH, mail and trades are not counted: those items were already counted
@@ -46,6 +46,9 @@ accent and bar fill); a plain flat dark window otherwise. Item values come from
 Auctionator when it's installed; without it every item counts at vendor price.
 
 ## Changelog
+
+### 1.1.3 (2026-11-24 20:12 EST)
+- Grey (poor quality) items count at vendor price only, never their AH price.
 
 ### 1.1.2 (2026-11-24 18:21 EST)
 - Fix: looted items weren't counted. Forever hides some loot chat lines from addons, so items are now read from the loot window and counted once you take them (or they land in your bags), quest reward items from your bags right after a turn-in, and coin from your money going up while looting.

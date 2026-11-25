@@ -12,7 +12,7 @@
 -- Styled through EllesmereUI's skinning API when it's installed; a plain flat dark look otherwise.
 
 local ADDON = ...
-local VERSION = "1.1.2"
+local VERSION = "1.1.3"
 
 local DEFAULTS = { shown = true, history = {}, collapsed = {} }
 local db                                  -- XPMeterDB (per character)
@@ -213,7 +213,8 @@ end
 -- Coin: your money going up while a loot window is open (or up to 2 s after it closes). A party member's
 --   coin share, which arrives without your loot window, comes from its chat line when that's readable.
 -- Items: what's new in your bags while looting, valued once, when looted, at max(Auctionator's AH price,
---   vendor price); soulbound (bind on pickup) items can't be sold on the AH, so they only count their vendor price.
+--   vendor price); soulbound (bind on pickup) items can't be sold on the AH and grey (poor) items are vendor
+--   trash, so both only count their vendor price.
 -- Quest rewards: QUEST_TURNED_IN's money, plus items new in your bags within 3 s of a turn-in.
 -- Money from selling to vendors or the AH, mail and trades is NOT counted: the items were already counted
 -- when looted, so counting the sale too would count them twice. Bag changes outside looting (buying, mail,
@@ -245,14 +246,15 @@ end
 local pending = {}   -- items whose info wasn't cached yet: { link, count, quest, tries }
 local function AddItem(link, count, quest, tries)
   if not Readable(link) then D("item link is secret, skipped"); return end
-  local name, _, _, _, _, _, _, _, _, _, sell, _, _, bind = ItemInfo(link)
+  local name, _, quality, _, _, _, _, _, _, _, sell, _, _, bind = ItemInfo(link)
   if not name then
     D("item not cached yet, will retry:", link, "x" .. count)
     if (tries or 0) < 10 then pending[#pending + 1] = { link, count, quest, (tries or 0) + 1 } end
     return
   end
   local vendor = VendorPrice(link, sell)
-  local ah = (bind ~= 1) and AHPrice(link) or nil      -- bind 1 = bind on pickup
+  -- bind 1 = bind on pickup; quality 0 = poor (grey): both count their vendor price only
+  local ah = (bind ~= 1 and quality ~= 0) and AHPrice(link) or nil
   local each, src = vendor, "vendor"
   if ah and ah > vendor then each, src = ah, "ah" end
   local value = each * count
